@@ -115,7 +115,7 @@ def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_no
         Sn = np.logical_xor(S, adj_pert_idx).astype(float)
     elif type == "rewire":
         # Edge rewiring
-        idx_edges = np.where(np.triu(S) != 0)
+        idx_edges = np.where(np.triu(S,1) != 0)
         Ne = idx_edges[0].size
         unpert_edges = np.arange(Ne)
         for i in range(int(Ne*eps)):
@@ -129,7 +129,7 @@ def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_no
         Sn = np.zeros((N,N))
         Sn[idx_edges] = 1.
         assert np.all(np.tril(Sn) == 0)
-        Sn = Sn + Sn.T
+        Sn = Sn + Sn.T + np.diag(np.diag(S))
     elif type == "creat-dest":
 
         creat = creat if creat is not None else eps
