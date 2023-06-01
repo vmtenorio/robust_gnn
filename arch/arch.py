@@ -103,10 +103,22 @@ class GCNModel1(nn.Module):
 
         return x
 
-    def update_S(self, newS):
+    def update_S(self, newS, normalize=True):
         self.S.data = newS
+        if normalize:
+            self.normalize_S()
         for conv in self.convs:
-            conv.S.data = newS
+            conv.S.data = self.S.data.clone()
+
+    def normalize_S(self):
+        unnorm_S = self.S.data.clone()
+        d = unnorm_S.sum(1)
+        D_inv = torch.diag(torch.sqrt(1/d))
+        D_inv[torch.isinf(D_inv)] = 0.
+
+        S_norm = D_inv @ unnorm_S @ D_inv
+
+        self.S.data = S_norm
 
 
 class GCNModel2(nn.Module):
@@ -135,7 +147,7 @@ class GCNModel2(nn.Module):
 
         return x
 
-    def update_S(self, newS):
+    def update_S(self, newS, normalize=True):
         self.S = newS
     
     def commutativity_term(self):

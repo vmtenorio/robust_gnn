@@ -1,12 +1,11 @@
 
-import logging
 import torch.nn as nn
 import torch
 
 import numpy as np
 from arch.arch import GCNModel1, GCNModel2
 
-from sev_filters_opt import graph_id, graph_id_rew
+from sev_filters_opt import graph_id
 
 
 ## Non-convex Robust GNN Models
@@ -41,6 +40,8 @@ class RobustGNNModel:
             labels = labels[mask]
             _, indices = torch.max(logits, dim=1)
             correct = torch.sum(indices == labels)
+            if len(labels) == 0:
+                return 0.
             return correct.item() * 1.0 / len(labels)
         
     def evaluate_reg(self, features, labels, mask):
@@ -79,7 +80,7 @@ class RobustGNNModel:
 
         return acc_train, acc_val, acc_test, losses
     
-    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None):
+    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=True):
 
         errs_S = np.zeros(self.n_iters_S)
         change_S = np.zeros(self.n_iters_S)
@@ -104,19 +105,20 @@ class RobustGNNModel:
             S = S_prox
 
             # Projection onto \mathcal{S}
-            S = torch.where(S < 0., 0., S)
-            S = torch.where(S > 1., 1., S)
+            S = torch.clamp(S, min=0., max=1.)
             S = (S + S.T) / 2
 
-            errs_S[i] = torch.linalg.norm(S - S_true) / norm_S
+            #errs_S[i] = torch.linalg.norm(S - S_true) / norm_S
+            
+            errs_S[i] = torch.linalg.norm(S/torch.linalg.norm(S) - S_true/norm_S)
             change_S[i] = torch.linalg.norm(S - orig_S) / norm_S
 
-            self.model.update_S(S)
+            self.model.update_S(S, normalize=norm_S)
             
         return errs_S, change_S
 
     
-    def test_model(self, Sn, x, labels, gamma, lambd, beta, train_idx=[], val_idx=[], test_idx=[], S_true=None, verbose=False):
+    def test_model(self, Sn, x, labels, gamma, lambd, beta, train_idx=[], val_idx=[], test_idx=[], norm_S=True, S_true=None, verbose=False):
 
         accs_train = np.zeros((self.n_iters_out, self.n_epochs))
         accs_test = np.zeros((self.n_iters_out, self.n_epochs))
@@ -127,13 +129,14 @@ class RobustGNNModel:
             #print("**************************************")
             #print(f"************ Iteration {i} ***********", end="")
             #print("**************************************")
+            errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, train_idx, S_true, norm_S)
+
             accs_train[i,:], _, accs_test[i,:], _ = self.stepH(x, labels, train_idx, val_idx, test_idx, )
 
             #print("Graph identification")
             # Graph estimation
-            errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, train_idx, S_true)
 
-            if verbose:
+            if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
                 print(f"Iteration {i+1} DONE - Acc Test: {accs_test[i,-1]} - Err S: {errs_S[i,-1]}")
 
         return accs_train, accs_test, self.model.S.data, errs_S, change_S
@@ -149,7 +152,7 @@ class RobustGNNModel1(RobustGNNModel):
         
         self.opt_hW = torch.optim.Adam(
             [layer.h for layer in self.model.convs] +
-            [layer.W for layer in self.model.convs] + 
+            [layer.W for layer in self.model.convs] +
             [layer.b for layer in self.model.convs],
             lr=self.lr, weight_decay=self.wd)
         
@@ -287,7 +290,7 @@ class ModelCVX:
 
             S_gcn = torch.Tensor(S_id).to(x.device)
 
-            self.update_S(S_gcn)
+            self.model.update_S(S_gcn)
             
             # Filter estimation
             accs_train[i,:], _, accs_test[i,:], _ = self.test_clas(S_gcn, x, labels, gamma, train_idx, val_idx, test_idx, verbose=False)
@@ -321,7 +324,7 @@ class ModelCVX:
 
             change_S = np.linalg.norm(self.model.S.data.cpu().numpy() - S_id)
 
-            self.update_S(S_gcn)
+            self.model.update_S(S_gcn)
             
             # Filter estimation
             loss_train[i,:], loss_test[i,:] = self.test_reg(S_gcn, x, labels, train_idx, val_idx, test_idx, verbose=False)
@@ -334,7 +337,7 @@ class ModelCVX:
 
             errs_S[i] = np.linalg.norm(S_id - S_true) / norm_S
 
-            if verbose:
+            if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
                 print(f"Iteration {i+1} DONE - Acc Test: {loss_test[i,-1]} - Err S: {errs_S[i]} - Change S: {change_S}")
 
         return loss_train, loss_test, S_id
@@ -360,9 +363,10 @@ class ModelCVX1(ModelCVX):
     
     def build_filters(self):
         Hs = []
+        Spow = torch.stack([torch.linalg.matrix_power(self.model.S.data, k) for k in range(self.model.K)])
         for conv in self.model.convs:
             h_id = conv.h.data
-            Hs.append(torch.sum(h_id[:,None,None]*self.model.Spow, 0).cpu().numpy())
+            Hs.append(torch.sum(h_id[:,None,None]*Spow, 0).cpu().numpy())
         return np.array(Hs)
 
 class ModelCVX2(ModelCVX):
