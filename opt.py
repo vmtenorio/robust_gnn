@@ -1,11 +1,70 @@
 import cvxpy as cp
 import numpy as np
+import numpy.linalg as la
+#import torch
 from scipy.linalg import khatri_rao
 
 # Imported here to be able to call getattr(opt, func_name)
 #from opt_lls import estH_llsscp
 
 VERB = False
+
+def proj_prox_A(An, H, eta, beta, lambd, gamma, A_init=None, max_iters=50, eps=5e-3, verbose=False):
+    """
+    - eta: gradient stepsize
+    - beta: controls sparsity of A
+    - lambd: controls distance between A and An
+    - gamma: controls the commutativity of H and S
+    """
+    N = An.shape[0]
+    A_iters = np.zeros((max_iters+1, N, N))
+
+    lambd *= eta
+    beta *= eta
+
+    if A_init is None:
+        # A_iters[0] = np.zeros(An.shape)
+        A_iters[0] = An
+    else:
+        A_iters[0] = A_init
+
+    for i in range(1, max_iters+1):
+        Aprev = A_iters[i-1]
+        # Gradient update
+        grad = 2*gamma*(H.T @ H @ Aprev - H.T @ Aprev @ H - H @ Aprev @ H.T + Aprev @ H @ H.T)
+        grad += beta*np.ones(An.shape)
+        A = Aprev - eta*grad
+
+        # Proximal ||S - Sn||_1
+        # TODO: maybe a single loop will be faster
+        idxs_greater = np.where(A - An > lambd)
+        idxs_lower = np.where(A - An < -lambd)
+
+        A_prox = An.copy()
+        A_prox[idxs_greater] = A[idxs_greater] - lambd
+        A_prox[idxs_lower] = A[idxs_lower] + lambd
+        A = A_prox
+
+        # Projection onto set of adjacency matrices
+        #np.fill_diagonal(A, 0)
+        A[A < 0] = 0
+        # A[A > 1] = 1
+        A = (A + A.T)/2
+
+        A_iters[i] = A
+
+        if verbose:
+            distance = la.norm(A - Aprev, 'fro')/la.norm(Aprev, 'fro')
+            sing_val = np.max(la.svd(grad, compute_uv=False))
+            norm_A = la.norm(A,'fro')
+            print(f'Iter  {i} :  norm(A): {norm_A:.1f}  -  sing val(grad): {sing_val:.1f}  -  distance(S-Sprev): {distance:.3f}')
+
+        # Stopping condition    
+        if i > 0 and la.norm(A - Aprev, 'fro')/la.norm(Aprev, 'fro') < eps:
+                break
+        
+    return A, A_iters
+
 
 def filter_id(Y, X, S, gamma, delta, Cy, verb=VERB):
     """
@@ -45,6 +104,11 @@ def filter_id(Y, X, S, gamma, delta, Cy, verb=VERB):
 def graph_id(Sn, H, Cy, lambd, gamma, delta, verb=VERB):
     """
     Performs the filter identification step of the robust filter identification algorithm
+    - Sn: observed (perturbed) GSO
+    - H: graph fitler
+    - lambd: controls the distance between perturbed and estimated S
+    - gamma: controls the commutativity of H and S
+    - delta: only for stationary data. Controls commutativity of S and Cy
     """
     S = cp.Variable(H.shape, symmetric=True)
     s_loss = cp.sum(cp.abs(S - Sn))

@@ -1,4 +1,3 @@
-
 import torch.nn as nn
 import torch
 
@@ -7,13 +6,11 @@ from arch.arch import GCNModel1, GCNModel2
 
 from sev_filters_opt import graph_id
 
-
 ## Non-convex Robust GNN Models
 
 class RobustGNNModel:
-    def __init__(self, S, n_epochs, lr, wd, lr_S, eval_freq, model_params, n_iters_out, n_iters_S, problem_type="clas"):
-
-        self.n_epochs = n_epochs
+    def __init__(self, S0, n_iters_H, lr, wd, lr_S, eval_freq, model_params, n_iters_out, n_iters_S,
+                 problem_type="clas", reduct='mean'):
         self.lr = lr
         self.lr_S = lr_S
         self.wd = wd
@@ -21,16 +18,18 @@ class RobustGNNModel:
         self.eval_freq = eval_freq
 
         self.n_iters_out = n_iters_out
+        self.n_iters_H = n_iters_H
         self.n_iters_S = n_iters_S
 
-        self.build_model(S.clone(), model_params)
-        
+        self.build_model(S0.clone(), model_params)
+
         self.problem_type = problem_type
 
         if self.problem_type == "clas":
-            self.loss_fn = nn.CrossEntropyLoss()
+            self.loss_fn = nn.CrossEntropyLoss(reduction=reduct)
+            # self.loss_fn = nn.NLLLoss(reduction=reduct)
         elif self.problem_type == "reg":
-            self.loss_fn = nn.MSELoss()
+            self.loss_fn = nn.MSELoss(reduction=reduct)
 
     def evaluate_clas(self, features, labels, mask):
         self.model.eval()
@@ -52,14 +51,14 @@ class RobustGNNModel:
             labels = labels[mask]
             return ((logits - labels)**2).mean()
 
-    def stepH(self, x, labels, train_idx, val_idx, test_idx, S=None, verbose=False):
+    # Step W_H
+    def stepH(self, x, labels, train_idx, val_idx, test_idx, gamma=1, S=None, verbose=False):
+        acc_train, acc_val, acc_test, losses = [np.zeros(self.n_iters_H) for _ in range(4)]
 
-        acc_train, acc_val, acc_test, losses = [np.zeros(self.n_epochs) for _ in range(4)]
-
-        for i in range(self.n_epochs):
+        for i in range(self.n_iters_H):
             self.model.train()
             y = self.model(x).squeeze()
-            loss = self.calc_loss(y[train_idx], labels[train_idx])
+            loss = self.calc_loss(y[train_idx], labels[train_idx], gamma)
 
             self.opt_hW.zero_grad()
             loss.backward()
@@ -76,25 +75,29 @@ class RobustGNNModel:
             losses[i] = loss.item()
 
             if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
-                print(f"Epoch {i+1}/{self.n_epochs} - Loss: {loss.item()} - Train Acc: {acc_train[i]} - Test Acc: {acc_test[i]}")
+                print(f"\tEpoch (H) {i+1}/{self.n_iters_H} - Loss: {loss.item():.3f} - Train Acc: {acc_train[i]:.3f} - Test Acc: {acc_test[i]:.3f}")
 
         return acc_train, acc_val, acc_test, losses
     
-    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=True):
+    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=True,
+              test_idx=[], debug=False):
 
         errs_S = np.zeros(self.n_iters_S)
         change_S = np.zeros(self.n_iters_S)
         norm_S = torch.linalg.norm(S_true)
 
+        # self.model.train()
+
+        lambd *= self.lr_S
+        beta *= self.lr_S
+
         for i in range(self.n_iters_S):
-            orig_S = self.model.S.data.clone()
+            self.model.train()
 
-            S = self.model.S.data.clone()
+            S_prev = self.model.S.data.clone()
+            norm_S_orig = torch.linalg.norm(S_prev)
 
-            S = self.gradient_step_S(S, gamma, x, labels, train_idx)
-
-            # Proximal for Sparsity
-            #S = torch.sign(S) * torch.maximum(torch.abs(S) - beta, torch.zeros(S.shape, device=S.device))
+            S, loss = self.gradient_step_S(x, labels, beta, gamma, train_idx)
 
             # Proximal for the distance to S_bar
             idxs_greater = torch.where(S - Sn > lambd)
@@ -108,33 +111,45 @@ class RobustGNNModel:
             S = torch.clamp(S, min=0., max=1.)
             S = (S + S.T) / 2
 
-            #errs_S[i] = torch.linalg.norm(S - S_true) / norm_S
-            
-            errs_S[i] = torch.linalg.norm(S/torch.linalg.norm(S) - S_true/norm_S)
-            change_S[i] = torch.linalg.norm(S - orig_S) / norm_S
+            errs_S[i] = torch.linalg.norm(S - S_true) / norm_S
+            change_S[i] = torch.linalg.norm(S - S_prev) / norm_S_orig
+
+            if debug and (i == 0 or (i+1) % self.eval_freq == 0):
+                norm_A =  torch.linalg.norm(S)
+                err_S2 = torch.linalg.norm(S/norm_A - S_true/norm_S)
+
+                if self.problem_type == "clas":
+                    eval_fn = self.evaluate_clas
+                elif self.problem_type == "reg":
+                    eval_fn = self.evaluate_reg
+                # Compute loss on training/validation/test # TODO change name of variables
+                acc_train = eval_fn(x, labels, train_idx)
+                acc_test = eval_fn(x, labels, test_idx)
+
+                print(f'\tEpoch (S) {i+1}/{self.n_iters_S}: Loss: {loss:.2f}  - Train Acc: {acc_train:.2f} - Test Acc: {acc_test:.2f} - S-Sprev: {change_S[i]:.3f}  -  err_S: {errs_S[i]:.3f}  -  err_S (free scale): {err_S2:.3f}')
 
             self.model.update_S(S, normalize=norm_S)
             
+            # TODO: stopping criterion
+        
         return errs_S, change_S
 
-    
-    def test_model(self, Sn, x, labels, gamma, lambd, beta, train_idx=[], val_idx=[], test_idx=[], norm_S=True, S_true=None, verbose=False):
+    def test_model(self, Sn, x, labels, gamma, lambd, beta, train_idx=[], val_idx=[], test_idx=[],
+                   norm_S=False, S_true=None, verbose=False, debug_S=False, debug_H=False):
 
-        accs_train = np.zeros((self.n_iters_out, self.n_epochs))
-        accs_test = np.zeros((self.n_iters_out, self.n_epochs))
+        accs_train = np.zeros((self.n_iters_out, self.n_iters_H))
+        accs_test = np.zeros((self.n_iters_out, self.n_iters_H))
         errs_S = np.zeros((self.n_iters_out, self.n_iters_S))
         change_S = np.zeros((self.n_iters_out, self.n_iters_S))
 
         for i in range(self.n_iters_out):
-            #print("**************************************")
-            #print(f"************ Iteration {i} ***********", end="")
-            #print("**************************************")
-            errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, train_idx, S_true, norm_S)
+            # TODO: separate step for H and W
+            accs_train[i,:], _, accs_test[i,:], _ = self.stepH(x, labels, train_idx, val_idx,
+                                                               test_idx, gamma, verbose=debug_H)
 
-            accs_train[i,:], _, accs_test[i,:], _ = self.stepH(x, labels, train_idx, val_idx, test_idx, )
-
-            #print("Graph identification")
             # Graph estimation
+            errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, train_idx,
+                                                    S_true, norm_S=norm_S, test_idx=test_idx, debug=debug_S)
 
             if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
                 print(f"Iteration {i+1} DONE - Acc Test: {accs_test[i,-1]} - Err S: {errs_S[i,-1]}")
@@ -150,50 +165,83 @@ class RobustGNNModel1(RobustGNNModel):
     def build_model(self, S, model_params):
         self.model = GCNModel1(S=S, **model_params)
         
-        self.opt_hW = torch.optim.Adam(
-            [layer.h for layer in self.model.convs] +
-            [layer.W for layer in self.model.convs] +
-            [layer.b for layer in self.model.convs],
-            lr=self.lr, weight_decay=self.wd)
+        if model_params['bias']:
+            self.opt_hW = torch.optim.Adam(
+                [layer.h for layer in self.model.convs] +
+                [layer.W for layer in self.model.convs] + 
+                [layer.b for layer in self.model.convs],
+                lr=self.lr, weight_decay=self.wd)
+        else:
+            self.opt_hW = torch.optim.Adam(
+                [layer.h for layer in self.model.convs] +
+                [layer.W for layer in self.model.convs],
+                lr=self.lr, weight_decay=self.wd)
         
-        self.opt_S = torch.optim.SGD(
-            [self.model.S],
-            lr=self.lr_S)
+        self.opt_S = torch.optim.SGD([self.model.S], lr=self.lr_S)
 
-    def calc_loss(self, y_hat, y_train):
+    # NOTE: gamma added to keep using same function with models 1 and 2
+    def calc_loss(self, y_hat, y_train, gamma=None):
         return self.loss_fn(y_hat, y_train)
     
-    def gradient_step_S(self, S=None, gamma=None, x=None, y=None, train_idx=None):
+    # Adding sparsity term
+    def calc_loss_S(self, y_hat, y_train, beta=1):
+        return self.loss_fn(y_hat, y_train) + beta*torch.sum(self.model.S)
+
+
+    def gradient_step_S(self, x, y, beta=1, gamma=None, train_idx=None):
         y_hat = self.model(x).squeeze()
-        loss = self.calc_loss(y_hat[train_idx], y[train_idx])
+        loss = self.calc_loss_S(y_hat[train_idx], y[train_idx], beta)
 
         self.opt_S.zero_grad()
         loss.backward()
         self.opt_S.step()
 
-        return self.model.S.data
+        return self.model.S.data, loss.item()
         
 ###############################################################
 ######################## MODEL 2 ##############################
 ###############################################################
-
 class RobustGNNModel2(RobustGNNModel):
-
     def build_model(self, S, model_params):
         self.model = GCNModel2(S=S, **model_params)
 
         self.opt_hW = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
 
-    def calc_loss(self, y_hat, y_train):
-        return self.loss_fn(y_hat, y_train) + self.model.commutativity_term()
-    
-    def gradient_step_S(self, S, gamma, x=None, y=None, train_idx=None):
-        for layer in self.model.convs:
-            H = layer.H.data
-            S -= 2*gamma*(H.T @ H @ S - H.T @ S @ H - H @ S @ H.T + S @ H @ H.T)
-        return S
+    def calc_loss(self, y_hat, y_train, gamma=1):
+        return self.loss_fn(y_hat, y_train) + gamma*self.model.commutativity_term()
     
 
+    # NOTE: Assume S=A
+    def gradient_step_S(self, S, gamma=1, beta=1, x=None, y=None, train_idx=None):
+        grad = 0
+        for layer in self.model.convs:
+            H = layer.H.data
+            # Gradient corresponding to commutativity || HA-AH ||_F^2
+            grad += 2*gamma*(H.T @ H @ S - H.T @ S @ H - H @ S @ H.T + S @ H @ H.T)
+            # S -= 2*gamma*(H.T @ H @ S - H.T @ S @ H - H @ S @ H.T + S @ H @ H.T)
+
+        # Gradient corresponding to sparsity of A
+        grad += beta*torch.ones(S.shape, device=S.device)
+        return S - self.lr_S*grad
+    
+
+
+###############################################################
+####################### MY MODEL 2 ############################
+###############################################################
+# TODO: distinguir entre Sn y S_init
+# TODO: separar update H y W
+class RobustGNNModel2_v2(RobustGNNModel):
+    def build_model(self, S, model_params):
+        self.model = GCNModel2(S=S, **model_params)
+        self.opt_W = torch.optim.Adam([layer.W for layer in self.model.convs],
+                                      r=self.lr, weight_decay=self.wd)
+        self.opt_H = torch.optim.Adam([layer.H for layer in self.model.convs],
+                                      lr=self.lr, weight_decay=self.wd)
+
+    def calc_loss(self, y_hat, y_train, gamma=1):
+        return self.loss_fn(y_hat, y_train) + gamma*self.model.commutativity_term()
+        
 
 
 
@@ -203,7 +251,7 @@ class RobustGNNModel2(RobustGNNModel):
 class ModelCVX:
     def __init__(self, S, n_epochs, lr, wd, eval_freq, model_params):
 
-        self.n_epochs = n_epochs
+        self.n_iters_H = n_epochs
         self.lr = lr
         self.wd = wd
 
@@ -229,9 +277,9 @@ class ModelCVX:
 
     def test_reg(self, S, X, Y, train_idx=[], val_idx=[], test_idx=[], verbose=True):
 
-        loss_train, loss_test = [np.zeros(self.n_epochs) for _ in range(2)]
+        loss_train, loss_test = [np.zeros(self.n_iters_H) for _ in range(2)]
 
-        for i in range(self.n_epochs):
+        for i in range(self.n_iters_H):
             self.model.train()
             y_hat = self.model(X).squeeze()
             loss = self.calc_loss(y_hat[train_idx], Y[train_idx], S)
@@ -244,7 +292,7 @@ class ModelCVX:
             loss_test[i] = self.evaluate_reg(X, Y, test_idx)
 
             if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
-                print(f"Epoch {i+1}/{self.n_epochs} - Loss train: {loss_train[i]} - Loss: {loss_test[i]}", flush=True)
+                print(f"Epoch {i+1}/{self.n_iters_H} - Loss train: {loss_train[i]} - Loss: {loss_test[i]}", flush=True)
 
         return loss_train, loss_test
 
@@ -254,9 +302,9 @@ class ModelCVX:
 
         loss_fn = nn.CrossEntropyLoss()
 
-        acc_train, acc_val, acc_test, losses = [np.zeros(self.n_epochs) for _ in range(4)]
+        acc_train, acc_val, acc_test, losses = [np.zeros(self.n_iters_H) for _ in range(4)]
 
-        for i in range(self.n_epochs):
+        for i in range(self.n_iters_H):
             y = self.model(x)
             loss = self.calc_loss(y[train_idx], labels[train_idx], S)
 
@@ -272,7 +320,7 @@ class ModelCVX:
             losses[i] = loss.item()
 
             if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
-                print(f"Epoch {i+1}/{self.n_epochs} - Loss: {loss.item()} - Train Acc: {acc_train[i]} - Test Acc: {acc_test[i]}", flush=True)
+                print(f"Epoch {i+1}/{self.n_iters_H} - Loss: {loss.item()} - Train Acc: {acc_train[i]} - Test Acc: {acc_test[i]}", flush=True)
 
         return acc_train, acc_val, acc_test, losses
 
@@ -280,8 +328,8 @@ class ModelCVX:
 
         S_id = Sn
 
-        accs_train = np.zeros((n_iters, self.n_epochs))
-        accs_test = np.zeros((n_iters, self.n_epochs))
+        accs_train = np.zeros((n_iters, self.n_iters_H))
+        accs_test = np.zeros((n_iters, self.n_iters_H))
 
         for i in range(n_iters):
             #print("**************************************")
@@ -309,8 +357,8 @@ class ModelCVX:
         S_id = Sn.cpu().numpy()
         S_true = S_true.cpu().numpy()
 
-        loss_train = np.zeros((n_iters, self.n_epochs))
-        loss_test = np.zeros((n_iters, self.n_epochs))
+        loss_train = np.zeros((n_iters, self.n_iters_H))
+        loss_test = np.zeros((n_iters, self.n_iters_H))
         errs_S = np.zeros((n_iters))
 
         norm_S = np.linalg.norm(S_true)
