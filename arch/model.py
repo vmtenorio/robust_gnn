@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch
 
 import numpy as np
-from arch.arch import GCNModel1, GCNModel2
+from arch.arch import GCNModel1, ComGCNModel
 
 from sev_filters_opt import graph_id, graph_id_rew
 
@@ -11,26 +11,21 @@ from sev_filters_opt import graph_id, graph_id_rew
 
 class RobustGNNModel:
     def __init__(self, S0, n_iters_H, lr, wd, lr_S, eval_freq, model_params, n_iters_out, n_iters_S,
-                 problem_type="clas", reduct='mean'):
+                 problem_type="clas", reduct='mean', loss=nn.CrossEntropyLoss()):
         self.lr = lr
         self.lr_S = lr_S
         self.wd = wd
-
-        self.eval_freq = eval_freq
-
         self.n_iters_out = n_iters_out
         self.n_iters_H = n_iters_H
         self.n_iters_S = n_iters_S
 
-        self.build_model(S0.clone(), model_params)
+        self.eval_freq = eval_freq
+
+        self.build_model(S0.detach().clone(), model_params)
 
         self.problem_type = problem_type
+        self.loss_fn = loss
 
-        if self.problem_type == "clas":
-            self.loss_fn = nn.CrossEntropyLoss(reduction=reduct)
-            # self.loss_fn = nn.NLLLoss(reduction=reduct)
-        elif self.problem_type == "reg":
-            self.loss_fn = nn.MSELoss(reduction=reduct)
 
     def evaluate_clas(self, features, labels, mask):
         self.model.eval()
@@ -49,6 +44,45 @@ class RobustGNNModel:
             logits = logits[mask]
             labels = labels[mask]
             return ((logits - labels)**2).mean()
+
+
+    def trainGNN(self, x, labels, optimizer, loss, iters, train_idx, val_idx, test_idx):
+        acc_train, acc_test, loss_train, loss_test = [np.zeros(iters) for _ in range(4)]
+
+        # TODO: normalize H
+
+        # https://github.com/DSE-MSU/DeepRobust/blob/master/deeprobust/graph/defense/prognn.py#L275
+
+        for i in range(iters):
+            self.model.train()
+            optimizer.zero_grad()
+
+            y = self.model(x)
+            # TODO: properly prepare loss function, think what to do with gamma
+            loss = self.calc_loss(y[train_idx], labels[train_idx], gamma)
+            # TODO: compute accuracy train
+            loss.backward()
+            self.opt_hW.step()
+
+            # EVAL
+
+            #### FROM stepH ####
+            if self.problem_type == "clas":
+                eval_fn = self.evaluate_clas
+            elif self.problem_type == "reg":
+                eval_fn = self.evaluate_reg
+            # Compute loss on training/validation/test # TODO change name of variables
+            acc_train[i] = eval_fn(x, labels, train_idx)
+            acc_val[i] = eval_fn(x, labels, val_idx)
+            acc_test[i] = eval_fn(x, labels, test_idx)
+            losses[i] = loss.item()
+
+            if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
+                print(f"\tEpoch (H) {i+1}/{self.n_iters_H} - Loss: {loss.item():.3f} - Train Acc: {acc_train[i]:.3f} - Test Acc: {acc_test[i]:.3f}")
+
+        return acc_train, acc_val, acc_test, losses
+        return
+
 
     # Step W_H
     def stepH(self, x, labels, train_idx, val_idx, test_idx, gamma=1, S=None, verbose=False):
@@ -144,7 +178,10 @@ class RobustGNNModel:
         change_S = np.zeros((self.n_iters_out, self.n_iters_S))
 
         for i in range(self.n_iters_out):
-            # TODO: separate step for H and W
+            
+            if hasattr(self, "opt_W"):
+                self.trainGNN(x, labels, train_idx, val_idx, test_idx)
+
             accs_train[i,:], _, accs_test[i,:], _ = self.stepH(x, labels, train_idx, val_idx,
                                                                test_idx, gamma, verbose=debug_H)
 
@@ -162,7 +199,6 @@ class RobustGNNModel:
 ######################## MODEL 1 ##############################
 ###############################################################
 class RobustGNNModel1(RobustGNNModel):
-
     def build_model(self, S, model_params):
         self.model = GCNModel1(S=S, **model_params)
         
@@ -202,11 +238,26 @@ class RobustGNNModel1(RobustGNNModel):
 ###############################################################
 ######################## MODEL 2 ##############################
 ###############################################################
-class RobustGNNModel2(RobustGNNModel):
+class ComRGNNModel(RobustGNNModel):
+    """
+    Robust GNN model based on the commutativity of S and H
+    """
     def build_model(self, S, model_params):
-        self.model = GCNModel2(S=S, **model_params)
+        self.model = ComGCNModel(S=S, **model_params)
 
-        self.opt_hW = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
+        if model_params['bias']:
+            self.opt_W = torch.optim.Adam(
+                [layer.W for layer in self.model.convs] +
+                [layer.b for layer in self.model.convs],
+                lr=self.lr, weight_decay=self.wd)
+        else:
+            self.opt_W = torch.optim.Adam(
+                [layer.W for layer in self.model.convs],
+                lr=self.lr, weight_decay=self.wd)
+            
+        self.opt_H = torch.optim.Adam([layer.H for layer in self.model.convs],
+                                      lr=self.lr, weight_decay=self.wd)
+        self.opt_S = torch.optim.SGD([self.model.S], lr=self.lr_S)
 
     def calc_loss(self, y_hat, y_train, gamma=1):
         return self.loss_fn(y_hat, y_train) + gamma*self.model.commutativity_term()
@@ -223,27 +274,7 @@ class RobustGNNModel2(RobustGNNModel):
 
         # Gradient corresponding to sparsity of A
         grad += beta*torch.ones(S.shape, device=S.device)
-        return S - self.lr_S*grad
-    
-
-
-###############################################################
-####################### MY MODEL 2 ############################
-###############################################################
-# TODO: distinguir entre Sn y S_init
-# TODO: separar update H y W
-class RobustGNNModel2_v2(RobustGNNModel):
-    def build_model(self, S, model_params):
-        self.model = GCNModel2(S=S, **model_params)
-        self.opt_W = torch.optim.Adam([layer.W for layer in self.model.convs],
-                                      r=self.lr, weight_decay=self.wd)
-        self.opt_H = torch.optim.Adam([layer.H for layer in self.model.convs],
-                                      lr=self.lr, weight_decay=self.wd)
-
-    def calc_loss(self, y_hat, y_train, gamma=1):
-        return self.loss_fn(y_hat, y_train) + gamma*self.model.commutativity_term()
-        
-
+        return S - self.lr_S*grad     
 
 
 ###############################################################

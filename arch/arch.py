@@ -12,7 +12,7 @@ class GCNLayerM1(nn.Module):
         self.out_dim = out_dim
 
         self.h = nn.Parameter(torch.empty((self.K)))
-        torch.nn.init.constant_(self.h.data, 1./K)
+        torch.nn.init.constant_(self.h.data, 1.)
         
         self.W = nn.Parameter(torch.empty((self.in_dim, self.out_dim)))
         torch.nn.init.kaiming_uniform_(self.W.data)
@@ -65,17 +65,17 @@ class GCNLayerM1(nn.Module):
         #     return Hx @ self.W
 
 
-##### V2 #####
-class GCNLayerM2(nn.Module):
+class ComGCNLayer(nn.Module):
     def __init__(self, S, in_dim, out_dim, bias=True):
         super().__init__()
-        self.S = S
-        self.N = self.S.shape[0]
         self.in_dim = in_dim
         self.out_dim = out_dim
 
-        self.H = nn.Parameter(torch.empty((self.N, self.N)))
-        self.H.data = self.S + torch.eye(self.N, device=self.S.device)
+        # TODO: check other initializations
+        # Init H
+        self.H = nn.Parameter(torch.empty(S.shape))
+        self.H.data.copy_(S)
+        self.H.data += torch.eye(S.shape[0])
         
         self.W = nn.Parameter(torch.empty((self.in_dim, self.out_dim)))
         torch.nn.init.kaiming_uniform_(self.W.data)
@@ -87,15 +87,8 @@ class GCNLayerM2(nn.Module):
             self.b = None
 
     def forward(self, x):
-        if x.ndim == 3:
-            _, Nin, Fin = x.shape
-        else:
-            Nin, Fin = x.shape
-        assert Nin == self.N
-        assert Fin == self.in_dim
-        
         if self.b is not None:
-            return self.H @ x @ self.W + self.b[None,:]
+            return self.H @ x @ self.W + self.b
         else:
             return self.H @ x @ self.W
 
@@ -139,45 +132,41 @@ class GCNModel1(nn.Module):
         #     conv.S.data = newS
 
 
-##### V2 #####
-class GCNModel2(nn.Module):
+class ComGCNModel(nn.Module):
     def __init__(self, S, in_dim, hid_dim, out_dim, n_layers, bias=True, nonlin=nn.ReLU,
                  last_nonlin=None):
         super().__init__()
-        self.S = S
-        self.N = self.S.shape[0]
 
+        assert n_layers > 1, 'n_layers must be at least 2'
+
+        self.S = nn.Parameter(torch.empty(S.shape))
+        self.S.data.copy_(S)
         self.nonlin = nonlin()
         self.last_nonlin =  last_nonlin() if last_nonlin else None
-
         self.n_layers = n_layers
-        self.convs = nn.ModuleList()
+        self.gcn = nn.ModuleList()
 
-        ### SPECIFIC OF THE MODEL ###
-        self.convs.append(GCNLayerM2(self.S, in_dim, hid_dim, bias))
+        self.gcn.append(ComGCNLayer(S, in_dim, hid_dim, bias))
 
         if n_layers > 1:
             for i in range(n_layers - 2):
-                self.convs.append(GCNLayerM2(self.S, hid_dim, hid_dim, bias))
-            self.convs.append(GCNLayerM2(self.S, hid_dim, out_dim, bias))
-        #############################
-
+                self.gcn.append(ComGCNLayer(S, hid_dim, hid_dim, bias))
+            self.gcn.append(ComGCNLayer(S, hid_dim, out_dim, bias))
 
     def forward(self, x):
-
         for i in range(self.n_layers - 1):
-            x = self.nonlin(self.convs[i](x))
-        x = self.convs[-1](x)
+            x = self.nonlin(self.gcn[i](x))
+        x = self.gcn[-1](x)
 
         if self.last_nonlin:
             return self.last_nonlin(x)
         return x
 
-    def update_S(self, newS):
-        self.S = newS
+    # def update_S(self, newS):
+    #     self.S = newS
     
-    def commutativity_term(self):
-        commut = 0
-        for layer in self.convs:
-            commut += torch.linalg.norm(layer.H.data @ self.S - self.S @ layer.H.data, 'fro')**2
-        return commut
+    # def commutativity_term(self):
+    #     commut = 0
+    #     for layer in self.convs:
+    #         commut += torch.linalg.norm(layer.H.data @ self.S - self.S @ layer.H.data, 'fro')**2
+    #     return commut
