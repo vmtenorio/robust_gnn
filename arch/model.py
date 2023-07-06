@@ -50,7 +50,7 @@ class RobustGNNModel:
         acc_train, acc_test, loss_train, loss_test = [np.zeros(iters) for _ in range(4)]
 
         # TODO: normalize H
-
+        
         # https://github.com/DSE-MSU/DeepRobust/blob/master/deeprobust/graph/defense/prognn.py#L275
 
         for i in range(iters):
@@ -101,6 +101,7 @@ class RobustGNNModel:
                 eval_fn = self.evaluate_clas
             elif self.problem_type == "reg":
                 eval_fn = self.evaluate_reg
+                
             # Compute loss on training/validation/test # TODO change name of variables
             acc_train[i] = eval_fn(x, labels, train_idx)
             acc_val[i] = eval_fn(x, labels, val_idx)
