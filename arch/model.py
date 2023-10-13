@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 
 import numpy as np
-from arch.arch import GCNModel1, GCNModel2
+from arch.arch import GCNModel1, GCNModel2, GFGCN
 
 from sev_filters_opt import graph_id
 
@@ -10,7 +10,7 @@ from sev_filters_opt import graph_id
 
 class RobustGNNModel:
     def __init__(self, S0, n_iters_H, lr, wd, lr_S, eval_freq, model_params, n_iters_out, n_iters_S,
-                 problem_type="clas", reduct='mean'):
+                 problem_type="clas", loss_fn=nn.CrossEntropyLoss):
         self.lr = lr
         self.lr_S = lr_S
         self.wd = wd
@@ -26,11 +26,10 @@ class RobustGNNModel:
         self.problem_type = problem_type
 
         if self.problem_type == "clas":
-            self.loss_fn = nn.CrossEntropyLoss(reduction=reduct)
+            self.loss_fn = loss_fn()
             self.eval_fn = self.evaluate_clas
-            # self.loss_fn = nn.NLLLoss(reduction=reduct)
         elif self.problem_type == "reg":
-            self.loss_fn = nn.MSELoss(reduction=reduct)
+            self.loss_fn = loss_fn()
             self.eval_fn = self.evaluate_reg
 
     def evaluate_clas(self, features, labels, mask):
@@ -77,7 +76,7 @@ class RobustGNNModel:
 
         return acc_train, acc_val, acc_test, losses
     
-    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=True,
+    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=False,
               test_idx=[], debug=False):
 
         errs_S = np.zeros(self.n_iters_S)
@@ -186,17 +185,18 @@ class RobustGNNModel:
 class RobustGNNModel1(RobustGNNModel):
 
     def build_model(self, S, model_params):
-        self.model = GCNModel1(S=S, **model_params)
+        #self.model = GCNModel1(S=S, **model_params)
+        self.model = GFGCN(S=S, **model_params)
         
         if model_params['bias']:
             self.opt_hW = torch.optim.Adam(
-                [layer.h for layer in self.model.convs] +
+                #[layer.h for layer in self.model.convs] +
                 [layer.W for layer in self.model.convs] + 
                 [layer.b for layer in self.model.convs],
                 lr=self.lr, weight_decay=self.wd)
         else:
             self.opt_hW = torch.optim.Adam(
-                [layer.h for layer in self.model.convs] +
+                #[layer.h for layer in self.model.convs] +
                 [layer.W for layer in self.model.convs],
                 lr=self.lr, weight_decay=self.wd)
         
