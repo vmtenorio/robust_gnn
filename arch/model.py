@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 
 import numpy as np
-from arch.arch import GCNModel1, GCNModel2
+from arch.arch import GCNModel1, GCNModel2, GFGCN
 
 from sev_filters_opt import graph_id
 
@@ -10,7 +10,7 @@ from sev_filters_opt import graph_id
 
 class RobustGNNModel:
     def __init__(self, S0, n_iters_H, lr, wd, lr_S, eval_freq, model_params, n_iters_out, n_iters_S,
-                 problem_type="clas", reduct='mean'):
+                 problem_type="clas", loss_fn=nn.CrossEntropyLoss):
         self.lr = lr
         self.lr_S = lr_S
         self.wd = wd
@@ -26,10 +26,11 @@ class RobustGNNModel:
         self.problem_type = problem_type
 
         if self.problem_type == "clas":
-            self.loss_fn = nn.CrossEntropyLoss(reduction=reduct)
-            # self.loss_fn = nn.NLLLoss(reduction=reduct)
+            self.loss_fn = loss_fn()
+            self.eval_fn = self.evaluate_clas
         elif self.problem_type == "reg":
-            self.loss_fn = nn.MSELoss(reduction=reduct)
+            self.loss_fn = loss_fn()
+            self.eval_fn = self.evaluate_reg
 
     def evaluate_clas(self, features, labels, mask):
         self.model.eval()
@@ -64,14 +65,10 @@ class RobustGNNModel:
             loss.backward()
             self.opt_hW.step()
 
-            if self.problem_type == "clas":
-                eval_fn = self.evaluate_clas
-            elif self.problem_type == "reg":
-                eval_fn = self.evaluate_reg
             # Compute loss on training/validation/test # TODO change name of variables
-            acc_train[i] = eval_fn(x, labels, train_idx)
-            acc_val[i] = eval_fn(x, labels, val_idx)
-            acc_test[i] = eval_fn(x, labels, test_idx)
+            acc_train[i] = self.eval_fn(x, labels, train_idx)
+            acc_val[i] = self.eval_fn(x, labels, val_idx)
+            acc_test[i] = self.eval_fn(x, labels, test_idx)
             losses[i] = loss.item()
 
             if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
@@ -79,7 +76,7 @@ class RobustGNNModel:
 
         return acc_train, acc_val, acc_test, losses
     
-    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=True,
+    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=False,
               test_idx=[], debug=False):
 
         errs_S = np.zeros(self.n_iters_S)
@@ -118,13 +115,9 @@ class RobustGNNModel:
                 norm_A =  torch.linalg.norm(S)
                 err_S2 = torch.linalg.norm(S/norm_A - S_true/norm_S)
 
-                if self.problem_type == "clas":
-                    eval_fn = self.evaluate_clas
-                elif self.problem_type == "reg":
-                    eval_fn = self.evaluate_reg
                 # Compute loss on training/validation/test # TODO change name of variables
-                acc_train = eval_fn(x, labels, train_idx)
-                acc_test = eval_fn(x, labels, test_idx)
+                acc_train = self.eval_fn(x, labels, train_idx)
+                acc_test = self.eval_fn(x, labels, test_idx)
 
                 print(f'\tEpoch (S) {i+1}/{self.n_iters_S}: Loss: {loss:.2f}  - Train Acc: {acc_train:.2f} - Test Acc: {acc_test:.2f} - S-Sprev: {change_S[i]:.3f}  -  err_S: {errs_S[i]:.3f}  -  err_S (free scale): {err_S2:.3f}')
 
@@ -135,12 +128,16 @@ class RobustGNNModel:
         return errs_S, change_S
 
     def test_model(self, Sn, x, labels, gamma, lambd, beta, train_idx=[], val_idx=[], test_idx=[],
-                   norm_S=False, S_true=None, verbose=False, debug_S=False, debug_H=False):
+                   norm_S=False, S_true=None, es_patience=-1, verbose=False, debug_S=False, debug_H=False):
 
         accs_train = np.zeros((self.n_iters_out, self.n_iters_H))
         accs_test = np.zeros((self.n_iters_out, self.n_iters_H))
         errs_S = np.zeros((self.n_iters_out, self.n_iters_S))
         change_S = np.zeros((self.n_iters_out, self.n_iters_S))
+
+        best_acc_val = 0.
+        best_iteration = 0
+        count_es = 0
 
         for i in range(self.n_iters_out):
             # TODO: separate step for H and W
@@ -150,11 +147,36 @@ class RobustGNNModel:
             # Graph estimation
             errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, train_idx,
                                                     S_true, norm_S=norm_S, test_idx=test_idx, debug=debug_S)
+            
+            if es_patience > 0:
+                val_acc = self.eval_fn(x, labels, val_idx)
+                if val_acc > best_acc_val:
+                    count_es = 0
+                    best_iteration = i
+                    best_acc_val = val_acc
+                else:
+                    count_es += 1
+
+                if count_es > es_patience:
+                    break
 
             if (i == 0 or (i+1) % self.eval_freq == 0) and verbose:
                 print(f"Iteration {i+1} DONE - Acc Test: {accs_test[i,-1]} - Err S: {errs_S[i,-1]}")
 
-        return accs_train, accs_test, self.model.S.data, errs_S, change_S
+        results_dict = {
+            'accs_train': accs_train,
+            'accs_test': accs_test,
+            'best_iteration': best_iteration,
+            'best_acc_val': best_acc_val
+        }
+
+        S_dict = {
+            'rec_S': self.model.S.data,
+            'errs_S': errs_S,
+            'change_S': change_S
+        }
+
+        return results_dict, S_dict
     
 
 ###############################################################
@@ -163,17 +185,18 @@ class RobustGNNModel:
 class RobustGNNModel1(RobustGNNModel):
 
     def build_model(self, S, model_params):
-        self.model = GCNModel1(S=S, **model_params)
+        #self.model = GCNModel1(S=S, **model_params)
+        self.model = GFGCN(S=S, **model_params)
         
         if model_params['bias']:
             self.opt_hW = torch.optim.Adam(
-                [layer.h for layer in self.model.convs] +
+                #[layer.h for layer in self.model.convs] +
                 [layer.W for layer in self.model.convs] + 
                 [layer.b for layer in self.model.convs],
                 lr=self.lr, weight_decay=self.wd)
         else:
             self.opt_hW = torch.optim.Adam(
-                [layer.h for layer in self.model.convs] +
+                #[layer.h for layer in self.model.convs] +
                 [layer.W for layer in self.model.convs],
                 lr=self.lr, weight_decay=self.wd)
         
