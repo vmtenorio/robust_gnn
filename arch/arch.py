@@ -291,7 +291,7 @@ class GFGCN(nn.Module):
         self.bias = bias
         self.convs = nn.ModuleList()
 
-        self.normalize_S()
+        #self.normalize_S()
 
         self.convs.append(diff_layer(in_dim, hid_dim, K, bias))
         if n_layers > 1:
@@ -320,3 +320,20 @@ class GFGCN(nn.Module):
         self.S.data = newS
         if normalize:
             self.normalize_S()
+
+
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, dropout=0.):
+        super(MLP, self).__init__()
+        self.layer1 = nn.Linear(in_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, out_dim)
+        self.nonlin = nn.ReLU()
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, h):
+        h = self.layer1(h)
+        h = self.nonlin(h)
+        h = self.dropout(h)
+        h = self.layer2(h)
+        return h
