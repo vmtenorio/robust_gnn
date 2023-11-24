@@ -2,7 +2,7 @@ import torch.nn as nn
 import torch
 
 import numpy as np
-from arch.arch import GCNModel1, GCNModel2, GFGCN
+from arch.arch import GCNModel1, GCNModel2, GFGCN, GCNLayerM2
 
 from sev_filters_opt import graph_id
 
@@ -76,12 +76,12 @@ class RobustGNNModel:
 
         return acc_train, acc_val, acc_test, losses
     
-    def stepS(self, Sn, x, labels, gamma, lambd, beta, train_idx, S_true=None, norm_S=False,
-              test_idx=[], debug=False):
+    def stepS(self, Sn, x, labels, gamma, lambd, beta, alpha, train_idx, S_true: np.ndarray=None, normalize_S: bool=False,
+              test_idx=[], pct_S_pert: float=1., debug: bool=False):
 
-        errs_S = np.zeros(self.n_iters_S)
-        change_S = np.zeros(self.n_iters_S)
-        norm_S = torch.linalg.norm(S_true)
+        errs_S: np.array = np.zeros(self.n_iters_S)
+        change_S: np.array = np.zeros(self.n_iters_S)
+        norm_S: float = torch.linalg.norm(S_true)
 
         # self.model.train()
 
@@ -94,7 +94,7 @@ class RobustGNNModel:
             S_prev = self.model.S.data.clone()
             norm_S_orig = torch.linalg.norm(S_prev)
 
-            S, loss = self.gradient_step_S(x, labels, beta, gamma, train_idx)
+            S, loss = self.gradient_step_S(S=S_prev, x=x, y=labels, beta=beta, gamma=gamma, train_idx=train_idx, Sn=Sn, alpha=alpha)
 
             # Proximal for the distance to S_bar
             idxs_greater = torch.where(S - Sn > lambd)
@@ -102,11 +102,17 @@ class RobustGNNModel:
             S_prox = Sn.clone()
             S_prox[idxs_greater] = S[idxs_greater] - lambd
             S_prox[idxs_lower] = S[idxs_lower] + lambd
-            S = S_prox
+
+            # Considering the part of S that we know is correct, and taking that from Sn
+            S_new = Sn.clone()
+            N_mod = int(S.shape[0]*pct_S_pert)
+            S_new[:N_mod,:N_mod] = S_prox[:N_mod,:N_mod]
+            
+            S = S_new
 
             # Projection onto \mathcal{S}
             S = torch.clamp(S, min=0., max=1.)
-            S = (S + S.T) / 2
+            # S = (S + S.T) / 2 # Not suitable for non-symmetric matrices
 
             errs_S[i] = torch.linalg.norm(S - S_true) / norm_S
             change_S[i] = torch.linalg.norm(S - S_prev) / norm_S_orig
@@ -121,14 +127,16 @@ class RobustGNNModel:
 
                 print(f'\tEpoch (S) {i+1}/{self.n_iters_S}: Loss: {loss:.2f}  - Train Acc: {acc_train:.2f} - Test Acc: {acc_test:.2f} - S-Sprev: {change_S[i]:.3f}  -  err_S: {errs_S[i]:.3f}  -  err_S (free scale): {err_S2:.3f}')
 
-            self.model.update_S(S, normalize=norm_S)
+            self.model.update_S(S, normalize=normalize_S)
             
             # TODO: stopping criterion
         
         return errs_S, change_S
 
-    def test_model(self, Sn, x, labels, gamma, lambd, beta, train_idx=[], val_idx=[], test_idx=[],
-                   norm_S=False, S_true=None, es_patience=-1, verbose=False, debug_S=False, debug_H=False):
+    def test_model(self, Sn, x, labels, gamma, lambd, beta, alpha=0., # Alpha is only for l2 norm and elasticnet
+                   train_idx=[], val_idx=[], test_idx=[],
+                   norm_S=False, pct_S_pert=1., S_true=None, es_patience=-1, verbose=False,
+                   debug_S=False, debug_H=False):
 
         accs_train = np.zeros((self.n_iters_out, self.n_iters_H))
         accs_test = np.zeros((self.n_iters_out, self.n_iters_H))
@@ -136,6 +144,8 @@ class RobustGNNModel:
         change_S = np.zeros((self.n_iters_out, self.n_iters_S))
 
         best_acc_val = 0.
+        best_acc_test = 0.
+        best_err_S = 0.
         best_iteration = 0
         count_es = 0
 
@@ -144,9 +154,11 @@ class RobustGNNModel:
             accs_train[i,:], _, accs_test[i,:], _ = self.stepH(x, labels, train_idx, val_idx,
                                                                test_idx, gamma, verbose=debug_H)
 
+            new_S = self.model.S.data.clone()
             # Graph estimation
-            errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, train_idx,
-                                                    S_true, norm_S=norm_S, test_idx=test_idx, debug=debug_S)
+            errs_S[i,:], change_S[i,:] = self.stepS(Sn, x, labels, gamma, lambd, beta, alpha, train_idx,
+                                                    S_true, normalize_S=norm_S, test_idx=test_idx,
+                                                    pct_S_pert=pct_S_pert, debug=debug_S)
             
             if es_patience > 0:
                 val_acc = self.eval_fn(x, labels, val_idx)
@@ -154,6 +166,8 @@ class RobustGNNModel:
                     count_es = 0
                     best_iteration = i
                     best_acc_val = val_acc
+                    best_acc_test = self.eval_fn(x, labels, test_idx)
+                    best_err_S = errs_S[i,-1]
                 else:
                     count_es += 1
 
@@ -167,13 +181,15 @@ class RobustGNNModel:
             'accs_train': accs_train,
             'accs_test': accs_test,
             'best_iteration': best_iteration,
-            'best_acc_val': best_acc_val
+            'best_acc_val': best_acc_val,
+            'best_acc_test': best_acc_test
         }
 
         S_dict = {
             'rec_S': self.model.S.data,
             'errs_S': errs_S,
-            'change_S': change_S
+            'change_S': change_S,
+            'best_err_S': best_err_S
         }
 
         return results_dict, S_dict
@@ -207,13 +223,18 @@ class RobustGNNModel1(RobustGNNModel):
         return self.loss_fn(y_hat, y_train)
     
     # Adding sparsity term
-    def calc_loss_S(self, y_hat, y_train, beta=1):
-        return self.loss_fn(y_hat, y_train) + beta*torch.sum(self.model.S)
+    def calc_loss_S(self, y_hat, y_train, beta=1, Sn=None, alpha=0):
+        
+        loss = self.loss_fn(y_hat, y_train)
+        loss += beta*torch.sum(self.model.S)
+        if Sn is not None and alpha > 0: # For L2 norm if needed
+            loss += alpha*((self.model.S - Sn)**2).mean()
+        return loss
 
 
-    def gradient_step_S(self, x, y, beta=1, gamma=None, train_idx=None):
+    def gradient_step_S(self, S=None, x=None, y=None, beta=1, gamma=None, train_idx=None, Sn=None, alpha=0.):
         y_hat = self.model(x).squeeze()
-        loss = self.calc_loss_S(y_hat[train_idx], y[train_idx], beta)
+        loss = self.calc_loss_S(y_hat[train_idx], y[train_idx], beta, Sn, alpha)
 
         self.opt_S.zero_grad()
         loss.backward()
@@ -235,17 +256,19 @@ class RobustGNNModel2(RobustGNNModel):
     
 
     # NOTE: Assume S=A
-    def gradient_step_S(self, S, gamma=1, beta=1, x=None, y=None, train_idx=None):
+    def gradient_step_S(self, S=None, x=None, y=None, beta=1, gamma=None, train_idx=None, Sn=None, alpha=0.):
         grad = 0
         for layer in self.model.convs:
             H = layer.H.data
             # Gradient corresponding to commutativity || HA-AH ||_F^2
             grad += 2*gamma*(H.T @ H @ S - H.T @ S @ H - H @ S @ H.T + S @ H @ H.T)
             # S -= 2*gamma*(H.T @ H @ S - H.T @ S @ H - H @ S @ H.T + S @ H @ H.T)
+        if Sn is not None and alpha > 0: # For L2 norm if needed
+            grad += 2*alpha*(S - Sn)
 
         # Gradient corresponding to sparsity of A
         grad += beta*torch.ones(S.shape, device=S.device)
-        return S - self.lr_S*grad
+        return S - self.lr_S*grad, -1.
     
 
 
