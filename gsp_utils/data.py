@@ -97,7 +97,7 @@ def generate_graph_filter(S, K, neg_coefs=True, exp_coefs=False, coef=1, sort_h=
     else:
         return H
 
-def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_node_idx=0):
+def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_node_idx=0, p_subset=0.5, n_p_white=0.):
     """
     Perturbate a given graph shift operator/adjacency matrix
 
@@ -124,8 +124,6 @@ def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_no
         idx_edges = np.where(np.triu(S,1) != 0)
         Ne = idx_edges[0].size
         unpert_edges = np.arange(Ne)
-        print(Ne)
-        print(Ne*eps)
         for i in range(int(Ne*eps)):
             idx_modify = np.random.choice(unpert_edges)
              # To prevent modifying the same edge twice
@@ -138,6 +136,21 @@ def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_no
         Sn[idx_edges] = 1.
         assert np.all(np.tril(Sn) == 0)
         Sn = Sn + Sn.T + np.diag(np.diag(S))
+    elif type == "rewire_nonsym":
+        # Edge rewiring
+        idx_edges = np.where(S != 0)
+        Ne = idx_edges[0].size
+        unpert_edges = np.arange(Ne)
+        for i in range(int(Ne*eps)):
+            idx_modify = np.random.choice(unpert_edges)
+            # To prevent modifying the same edge twice
+            unpert_edges = np.delete(unpert_edges, np.where(unpert_edges == idx_modify))
+            start = idx_edges[0][idx_modify]
+            new_end = np.random.choice(np.delete(np.arange(N), start))
+            idx_edges[0][idx_modify] = start
+            idx_edges[1][idx_modify] = new_end
+        Sn = np.zeros((N,N))
+        Sn[idx_edges] = 1.
     elif type == "creat-dest":
 
         creat = creat if creat is not None else eps
@@ -174,8 +187,20 @@ def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_no
         A_x_triu[idx_c] = 1.
         A_x_triu[idx_d] = 0.
         Sn = A_x_triu + A_x_triu.T
+    elif type == "subset":
+        N_mod = int(N*p_subset)
+        adj_pert_idx = np.random.rand(N_mod,N_mod) < eps
+        mask = np.zeros((N,N))
+        mask[:N_mod,:N_mod] = adj_pert_idx
+        Sn = np.logical_xor(S, mask).astype(float)
     else:
         raise NotImplementedError("Choose either prob, rewire or creat-dest perturbation types")
+    
+    if n_p_white > 0.:
+        Nlinks = Sn.sum()
+        Sn_all = Sn + n_p_white*np.linalg.norm(Sn)*np.random.randn(*Sn.shape) / np.sqrt(Nlinks)
+        Sn = np.where(Sn == 0, Sn, Sn_all)
+
     return Sn
 
 def gen_data(N, M, g_params, p_n, eps, K = 4, neg_coefs=True, exp_coefs=False, coef=1, sort_h=False, norm_S=False, norm_H=False, pert_type="rewire", creat=None, dest=None, sel_ratio=1, sel_node_idx=0, seed=None):
@@ -276,12 +301,21 @@ def get_data_dgl(dataset_name, verb=False, dev='cpu', idx=0):
 
     # get data split
     masks = {}
-    mask_labels = ['train', 'val', 'test']
-    for lab in mask_labels:
-        mask = g.ndata[lab + '_mask'].to(dev)
-        # Select first data splid if more than one is available
-        masks[lab] = mask[:,idx] if len(mask.shape) > 1 else mask
-
+    if type(idx) == int:
+        mask_labels = ['train', 'val', 'test']
+        for lab in mask_labels:
+            mask = g.ndata[lab + '_mask'].to(dev)
+            # Select first data splid if more than one is available
+            masks[lab] = mask[:,idx] if len(mask.shape) > 1 else mask
+    else:
+        assert sum(idx) == 1., "Partitions not adding to 1"
+        N = S.shape[0]
+        idxs = np.random.permutation(N)
+        masks['train'] = idxs[:int(N*idx[0])]
+        masks['val'] = idxs[int(N*idx[0]):int(N*(idx[0]+idx[1]))]
+        masks['test'] = idxs[int(N*(idx[0]+idx[1])):]
+        
+    
     if verb:
         N = S.shape[0]
 
