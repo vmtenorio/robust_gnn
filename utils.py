@@ -1,8 +1,164 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
-from dgl.nn import GraphConv, GATConv
+import dgl
 
+
+################
+# DATA RELATED #
+################
+def pert_S(S, type="rewire", eps=0.1, creat=None, dest=None, sel_ratio=1, sel_node_idx=0, p_subset=0.5, n_p_white=0.):
+    """
+    Perturbate a given graph shift operator/adjacency matrix
+
+    Assuming symmetry for every perturbation type but prob_nonsym
+
+    There are two types of perturbation
+    * prob: changes a value in the adjacency matrix with a certain
+    probability. May result in denser graphs
+    * rewire: rewire a percentage of original edges randomly
+    """
+    N = S.shape[0]
+
+    if type == "prob":
+        # Perturbated adjacency
+        adj_pert_idx = np.triu(np.random.rand(N,N) < eps, 1)
+        adj_pert_idx = adj_pert_idx + adj_pert_idx.T
+        Sn = np.logical_xor(S, adj_pert_idx).astype(float)
+    elif type == "prob_nonsym":
+        # Perturbated adjacency
+        adj_pert_idx = np.random.rand(N,N) < eps
+        Sn = np.logical_xor(S, adj_pert_idx).astype(float)
+    elif type == "rewire":
+        # Edge rewiring
+        idx_edges = np.where(np.triu(S,1) != 0)
+        Ne = idx_edges[0].size
+        unpert_edges = np.arange(Ne)
+        for i in range(int(Ne*eps)):
+            idx_modify = np.random.choice(unpert_edges)
+             # To prevent modifying the same edge twice
+            unpert_edges = np.delete(unpert_edges, np.where(unpert_edges == idx_modify))
+            start = idx_edges[0][idx_modify]
+            new_end = np.random.choice(np.delete(np.arange(N), start))
+            idx_edges[0][idx_modify] = min(start, new_end)
+            idx_edges[1][idx_modify] = max(start, new_end)
+        Sn = np.zeros((N,N))
+        Sn[idx_edges] = 1.
+        assert np.all(np.tril(Sn) == 0)
+        Sn = Sn + Sn.T + np.diag(np.diag(S))
+    elif type == "rewire_nonsym":
+        # Edge rewiring
+        idx_edges = np.where(S != 0)
+        Ne = idx_edges[0].size
+        unpert_edges = np.arange(Ne)
+        for i in range(int(Ne*eps)):
+            idx_modify = np.random.choice(unpert_edges)
+            # To prevent modifying the same edge twice
+            unpert_edges = np.delete(unpert_edges, np.where(unpert_edges == idx_modify))
+            start = idx_edges[0][idx_modify]
+            new_end = np.random.choice(np.delete(np.arange(N), start))
+            idx_edges[0][idx_modify] = start
+            idx_edges[1][idx_modify] = new_end
+        Sn = np.zeros((N,N))
+        Sn[idx_edges] = 1.
+    elif type == "creat-dest":
+
+        creat = creat if creat is not None else eps
+        dest = dest if dest is not None else eps
+
+        A_x_triu = S.copy()
+        A_x_triu[np.tril_indices(N)] = -1
+
+        no_link_i = np.where(A_x_triu == 0)
+        link_i = np.where(A_x_triu == 1)
+        Ne = link_i[0].size
+
+        # Create links
+        if sel_ratio > 1 and sel_node_idx > 0:
+            ps = np.array([sel_ratio if no_link_i[0][i] < sel_node_idx or no_link_i[1][i] < sel_node_idx else 1 for i in range(no_link_i[0].size)])
+            ps = ps / ps.sum()
+        else:
+            ps = np.ones(no_link_i[0].size) / no_link_i[0].size
+        links_c = np.random.choice(no_link_i[0].size, int(Ne * creat),
+                                replace=False, p=ps)
+        idx_c = (no_link_i[0][links_c], no_link_i[1][links_c])
+
+        # Destroy links
+        if sel_ratio > 1 and sel_node_idx > 0:
+            ps = np.array([sel_ratio if link_i[0][i] < sel_node_idx or link_i[1][i] < sel_node_idx else 1 for i in range(link_i[0].size)])
+            ps = ps / ps.sum()
+        else:
+            ps = np.ones(link_i[0].size) / link_i[0].size
+        links_d = np.random.choice(link_i[0].size, int(Ne * dest),
+                                replace=False, p=ps)
+        idx_d = (link_i[0][links_d], link_i[1][links_d])
+
+        A_x_triu[np.tril_indices(N)] = 0
+        A_x_triu[idx_c] = 1.
+        A_x_triu[idx_d] = 0.
+        Sn = A_x_triu + A_x_triu.T
+    elif type == "subset":
+        N_mod = int(N*p_subset)
+        adj_pert_idx = np.random.rand(N_mod,N_mod) < eps
+        mask = np.zeros((N,N))
+        mask[:N_mod,:N_mod] = adj_pert_idx
+        Sn = np.logical_xor(S, mask).astype(float)
+    else:
+        raise NotImplementedError("Choose either prob, rewire or creat-dest perturbation types")
+    
+    if n_p_white > 0.:
+        Nlinks = Sn.sum()
+        Sn_all = Sn + n_p_white*np.linalg.norm(Sn)*np.random.randn(*Sn.shape) / np.sqrt(Nlinks)
+        Sn = np.where(Sn == 0, Sn, Sn_all)
+
+    return Sn
+
+
+def get_data_dgl(dataset_name, verb=False, dev='cpu', idx=0):
+    dataset = getattr(dgl.data, dataset_name)(verbose=False)
+
+    g = dataset[0]
+
+    # get graph and node feature
+    S = g.adj().to_dense().numpy()
+    feat = g.ndata['feat'].to(dev)
+
+    # get labels
+    label = g.ndata['label'].to(dev)
+    n_class = dataset.num_classes
+
+    # get data split
+    masks = {}
+    mask_labels = ['train', 'val', 'test']
+    for lab in mask_labels:
+        mask = g.ndata[lab + '_mask'].to(dev)
+        # Select first data splid if more than one is available
+        masks[lab] = mask[:,idx] if len(mask.shape) > 1 else mask
+    
+    if verb:
+        N = S.shape[0]
+
+        node_hom = dgl.node_homophily(g, g.ndata['label'])
+        edge_hom = dgl.edge_homophily(g, g.ndata['label'])
+
+        print('Dataset:', dataset_name)
+        print(f'Number of nodes: {S.shape[0]}')
+        print(f'Number of features: {feat.shape[1]}')
+        print(f'Shape of signals: {feat.shape}')
+        print(f'Number of classes: {n_class}')
+        print(f'Norm of A: {np.linalg.norm(S, "fro")}')
+        print(f'Max value of A: {np.max(S)}')
+        print(f'Proportion of validation data: {torch.sum(masks["val"] == True).item()/N:.2f}')
+        print(f'Proportion of test data: {torch.sum(masks["test"] == True).item()/N:.2f}')
+        print(f'Node homophily: {node_hom:.2f}')
+        print(f'Edge homophily: {edge_hom:.2f}')
+
+    return S, feat, label, n_class, masks
+
+##########
+# Models #
+##########
 class GCNHLayer(nn.Module):
     def __init__(self, S, in_dim, out_dim, K=3, norm_S=True, bias=True):
         super(GCNHLayer, self).__init__()
@@ -101,8 +257,8 @@ class MLP(nn.Module):
 class GCNN(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, dropout=0., batch_norm=True):
         super(GCNN, self).__init__()
-        self.layer1 = GraphConv(in_dim, hidden_dim)
-        self.layer2 = GraphConv(hidden_dim, out_dim)
+        self.layer1 = dgl.nn.GraphConv(in_dim, hidden_dim)
+        self.layer2 = dgl.nn.GraphConv(hidden_dim, out_dim)
         self.batch_norm = batch_norm
         if batch_norm:
             self.bn = nn.BatchNorm1d(hidden_dim)
@@ -126,11 +282,11 @@ class GCNN(nn.Module):
 class GAT(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, num_heads, gat_params):
         super(GAT, self).__init__()
-        self.layer1 = GATConv(in_dim, hidden_dim, num_heads, **gat_params)
+        self.layer1 = dgl.nn.GATConv(in_dim, hidden_dim, num_heads, **gat_params)
         # Be aware that the input dimension is hidden_dim*num_heads since
         # multiple head outputs are concatenated together. Also, only
         # one attention head in the output layer.
-        self.layer2 = GATConv(hidden_dim * num_heads, out_dim, 1, **gat_params)
+        self.layer2 = dgl.nn.GATConv(hidden_dim * num_heads, out_dim, 1, **gat_params)
         self.nonlin = nn.ELU()
 
     def forward(self, graph, h):
@@ -141,7 +297,9 @@ class GAT(nn.Module):
         h = self.layer2(graph, h)
         return h.squeeze()
 
-
+####################
+# Training Classes #
+####################
 def evaluate(features, graph, labels, mask, model):
     model.eval()
     with torch.no_grad():
